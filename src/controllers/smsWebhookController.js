@@ -48,21 +48,39 @@ const verifySignature = (rawBody, signature, secret) => {
   );
 };
 
-const findSmsLog = async (data) => {
-  const messageId = data.message_id;
-  const metadata = data.metadata || {};
+// SasuSync documents task_id as the delivery lookup identifier.
+// Its webhook example names the corresponding field message_id.
+// Accept both names without assuming they are different identifiers.
+const getGatewayIdentifiers = (data) => {
+  return [
+    data.task_id,
+    data.message_id
+  ].filter(
+    (value, index, values) =>
+      typeof value === 'string' &&
+      value.trim() &&
+      values.indexOf(value) === index
+  );
+};
 
-  if (messageId) {
+const findSmsLog = async (data) => {
+  const identifiers = getGatewayIdentifiers(data);
+
+  // First try the provider's task/message identifier.
+  for (const identifier of identifiers) {
     const { data: log, error } = await supabase
       .from('sms_logs')
       .select('*')
-      .eq('gateway_message_id', messageId)
+      .eq('gateway_message_id', identifier)
       .maybeSingle();
 
     if (error) throw error;
     if (log) return log;
   }
 
+  // Metadata is the fallback if the provider identifier
+  // cannot yet be matched to the stored reservation.
+  const metadata = data.metadata || {};
   const reminderId = metadata.reminder_id;
   const shopId = metadata.shop_id || metadata.mechanic_id;
 
@@ -83,7 +101,6 @@ const findSmsLog = async (data) => {
 
 const refundFailedLog = async (log) => {
   if (!log || log.refunded_at) return;
-
   if (!FAILED_STATUSES.includes(log.status)) return;
 
   const { data, error } = await supabase.rpc('refund_sms_send', {
@@ -169,7 +186,8 @@ export const handleSasuSyncWebhook = async (req, res) => {
       });
     }
 
-    // Account-level events do not represent individual SMS messages.
+    // These events relate to the central SasuSync account,
+    // not an individual mechanic's SMS wallet.
     if (['low_balance', 'topup_succeeded'].includes(event)) {
       console.log(`[SMS Webhook] Account event received: ${event}`);
 
@@ -189,10 +207,16 @@ export const handleSasuSyncWebhook = async (req, res) => {
       });
     }
 
-    if (!data.message_id) {
+    const identifiers = getGatewayIdentifiers(data);
+    const metadata = data.metadata || {};
+
+    if (
+      identifiers.length === 0 &&
+      !(metadata.reminder_id && (metadata.shop_id || metadata.mechanic_id))
+    ) {
       return res.status(400).json({
         success: false,
-        error: 'Missing gateway message ID.'
+        error: 'Missing gateway identifier and reservation metadata.'
       });
     }
 
@@ -208,18 +232,30 @@ export const handleSasuSyncWebhook = async (req, res) => {
     const log = await findSmsLog(data);
 
     if (!log) {
-      // Return a retryable response if the reservation is not yet visible.
+      // A temporary failure allows the provider to retry
+      // if the webhook arrives before the reservation is available.
       return res.status(503).json({
         success: false,
         error: 'SMS reservation not found yet.'
       });
     }
 
+    // Preserve the task ID returned by the original send request.
+    // Do not replace it with a different identifier from a webhook.
+    const gatewayIdentifier =
+      log.gateway_message_id ||
+      data.task_id ||
+      data.message_id;
+
+    if (!gatewayIdentifier) {
+      throw new Error('No gateway identifier is available for this SMS log.');
+    }
+
     const { data: result, error: rpcError } = await supabase.rpc(
       'apply_sms_gateway_event',
       {
         p_log_id: log.id,
-        p_gateway_message_id: data.message_id,
+        p_gateway_message_id: gatewayIdentifier,
         p_status: status,
         p_event_at: new Date(eventTimestamp).toISOString(),
         p_gateway_response: payload
@@ -243,15 +279,13 @@ export const handleSasuSyncWebhook = async (req, res) => {
     if (FAILED_STATUSES.includes(latestLog.status)) {
       await refundFailedLog(latestLog);
       await updateReminderStatus(latestLog, latestLog.status);
-    } else if (
-      ['sent', 'delivered'].includes(latestLog.status)
-    ) {
+    } else if (['sent', 'delivered'].includes(latestLog.status)) {
       await updateReminderStatus(latestLog, latestLog.status);
     }
 
     console.log('[SMS Webhook] Event processed:', {
       event,
-      messageId: data.message_id,
+      gatewayIdentifier,
       status,
       applied: result?.applied,
       reason: result?.reason
@@ -262,7 +296,6 @@ export const handleSasuSyncWebhook = async (req, res) => {
       received: true,
       applied: result?.applied === true
     });
-
   } catch (error) {
     logError('Webhook processing failed', error);
 
