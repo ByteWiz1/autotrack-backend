@@ -89,6 +89,35 @@ async function markPaymentFailed(order, transaction) {
   return Boolean(data);
 }
 
+
+async function markPaymentAbandoned(order, transaction) {
+  // Only a confirmed Paystack abandonment may change a pending order.
+  if (
+    transaction.status !== 'abandoned' ||
+    transaction.reference !== order.reference
+  ) {
+    return false;
+  }
+
+  const { data, error } = await supabase
+    .from('sms_payment_orders')
+    .update({
+      status: 'abandoned',
+      failure_reason: 'Checkout abandoned.',
+      updated_at: new Date().toISOString()
+    })
+    .eq('reference', order.reference)
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return Boolean(data);
+}
+
 // Atomically credit wallet and mark order paid.
 async function completeSuccessfulPayment(order, transaction) {
   if (
@@ -371,6 +400,16 @@ export const verifySmsPayment = async (req, res) => {
         paymentStatus: 'failed'
       });
     }
+
+    if (transaction.status === 'abandoned') {
+  await markPaymentAbandoned(order, transaction);
+
+  return res.status(409).json({
+    success: false,
+    message: 'Paystack confirmed that this checkout was abandoned.',
+    paymentStatus: 'abandoned'
+  });
+}
 
     if (transaction.status !== 'success') {
       return res.status(409).json({
