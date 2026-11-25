@@ -5,10 +5,12 @@ import dotenv from 'dotenv';
 import crypto from 'node:crypto';
 
 import authRoutes from './routes/authRoutes.js';
+import paymentRoutes from './routes/paymentRoutes.js';
 import vehicleRoutes from './routes/vehicleRoutes.js';
 import smsRoutes from './routes/smsRoutes.js';
 import smsWebhookRoutes from './routes/smsWebhookRoutes.js';
 import { runSmsSchedulerBatch } from './services/smsScheduler.js';
+import { handlePaystackWebhook } from './controllers/paymentController.js';
 
 dotenv.config();
 
@@ -17,11 +19,24 @@ const app = express();
 // General middleware
 app.use(cors());
 
-// Webhook MUST be mounted before express.json().
+// IMPORTANT:
+// The SasuSync webhook must remain BEFORE express.json()
+// because it requires the original raw request body for HMAC verification.
 app.use('/api/webhooks/sasusync', smsWebhookRoutes);
 
-// Normal API JSON parsing
+// Paystack webhook: preserve the original raw request body
+// for HMAC signature verification.
+app.post(
+  '/api/webhooks/paystack',
+  express.raw({ type: 'application/json' }),
+  handlePaystackWebhook
+);
+
+// Parse JSON requests for normal API routes.
 app.use(express.json({ limit: '1mb' }));
+
+// Payment routes
+app.use('/api/payments', paymentRoutes);
 
 // Health check: keeps the existing Render wake-up endpoint.
 app.get('/', (req, res) => {
@@ -43,6 +58,7 @@ app.post('/api/internal/sms/run', async (req, res) => {
   }
 
   const authorization = req.get('authorization') || '';
+
   const suppliedToken = authorization.startsWith('Bearer ')
     ? authorization.slice(7)
     : '';
@@ -52,7 +68,7 @@ app.post('/api/internal/sms/run', async (req, res) => {
 
   const authorized =
     suppliedBuffer.length === expectedBuffer.length &&
-    crypto.timingSafeEqual(suppliedBuffer, expectedBuffer);
+    crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
 
   if (!authorized) {
     return res.status(401).json({
