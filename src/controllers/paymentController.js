@@ -10,34 +10,13 @@ import { supabase } from '../config/supabase.js';
 // Server-controlled SMS packages.
 // Prices are in pesewas (GHp).
 const SMS_PACKAGES = {
-  pkg_547: {
-    credits: 547,
-    amountKobo: 3590
-  },
-  pkg_1095: {
-    credits: 1095,
-    amountKobo: 7183
-  },
-  pkg_2191: {
-    credits: 2191,
-    amountKobo: 14369
-  },
-  pkg_3287: {
-    credits: 3287,
-    amountKobo: 21555
-  },
-  pkg_5479: {
-    credits: 5479,
-    amountKobo: 35926
-  },
-  pkg_13800: {
-    credits: 13800,
-    amountKobo: 90113
-  },
-  pkg_28860: {
-    credits: 28860,
-    amountKobo: 183889
-  }
+  pkg_547: { credits: 547, amountKobo: 3590 },
+  pkg_1095: { credits: 1095, amountKobo: 7183 },
+  pkg_2191: { credits: 2191, amountKobo: 14369 },
+  pkg_3287: { credits: 3287, amountKobo: 21555 },
+  pkg_5479: { credits: 5479, amountKobo: 35926 },
+  pkg_13800: { credits: 13800, amountKobo: 90113 },
+  pkg_28860: { credits: 28860, amountKobo: 183889 }
 };
 
 const PAYSTACK_BASE_URL = 'https://api.paystack.co';
@@ -52,6 +31,101 @@ function generatePaymentReference() {
     .toUpperCase()}`;
 }
 
+async function verifyPaystackTransaction(reference, secretKey) {
+  const response = await fetch(
+    `${PAYSTACK_BASE_URL}/transaction/verify/${encodeURIComponent(reference)}`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${secretKey}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Paystack verification HTTP ${response.status}`);
+  }
+
+  const result = await response.json();
+
+  if (!result.status || !result.data) {
+    throw new Error('Invalid Paystack verification response.');
+  }
+
+  return result.data;
+}
+
+async function markPaymentFailed(order, transaction) {
+  // Only a confirmed Paystack failure may change a pending order.
+  if (
+    transaction.status !== 'failed' ||
+    transaction.reference !== order.reference
+  ) {
+    return false;
+  }
+
+  const failureReason =
+    typeof transaction.gateway_response === 'string'
+      ? transaction.gateway_response.slice(0, 500)
+      : 'Paystack confirmed that the transaction failed.';
+
+  const { data, error } = await supabase
+    .from('sms_payment_orders')
+    .update({
+      status: 'failed',
+      failure_reason: failureReason,
+      updated_at: new Date().toISOString()
+    })
+    .eq('reference', order.reference)
+    .eq('status', 'pending')
+    .select('id')
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return Boolean(data);
+}
+
+// Atomically credit wallet and mark order paid.
+async function completeSuccessfulPayment(order, transaction) {
+  if (
+    transaction.status !== 'success' ||
+    transaction.reference !== order.reference ||
+    Number(transaction.amount) !== order.amount_kobo ||
+    transaction.currency !== order.currency ||
+    !Number.isSafeInteger(Number(transaction.id)) ||
+    Number(transaction.id) <= 0
+  ) {
+    return { valid: false };
+  }
+
+  const { data, error } = await supabase.rpc(
+    'complete_sms_payment_order',
+    {
+      p_reference: order.reference,
+      p_paystack_transaction_id: Number(transaction.id),
+      p_verified_amount_kobo: Number(transaction.amount),
+      p_verified_currency: transaction.currency
+    }
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  if (!data?.success) {
+    throw new Error('Atomic payment completion was not confirmed.');
+  }
+
+  return {
+    valid: true,
+    result: data
+  };
+}
+
 // GET /api/payments/packages
 export const getSmsPackages = async (req, res) => {
   const packages = Object.entries(SMS_PACKAGES).map(
@@ -64,10 +138,7 @@ export const getSmsPackages = async (req, res) => {
     })
   );
 
-  return res.json({
-    success: true,
-    packages
-  });
+  return res.json({ success: true, packages });
 };
 
 // POST /api/payments/initialize
@@ -101,7 +172,6 @@ export const initializeSmsPayment = async (req, res) => {
       });
     }
 
-    // Retrieve the authenticated garage's account details.
     const { data: shop, error: shopError } = await supabase
       .from('shops')
       .select('id, shop_name, email')
@@ -126,7 +196,6 @@ export const initializeSmsPayment = async (req, res) => {
 
     const reference = generatePaymentReference();
 
-    // Create the pending order BEFORE contacting Paystack.
     const { error: orderError } = await supabase
       .from('sms_payment_orders')
       .insert({
@@ -160,13 +229,11 @@ export const initializeSmsPayment = async (req, res) => {
       }
     };
 
-    // Optional callback URL, configured through environment variables.
     if (process.env.PAYSTACK_CALLBACK_URL) {
       paymentPayload.callback_url =
         process.env.PAYSTACK_CALLBACK_URL;
     }
 
-    // Initialize checkout directly with Paystack.
     const paystackResponse = await fetch(
       `${PAYSTACK_BASE_URL}/transaction/initialize`,
       {
@@ -182,10 +249,7 @@ export const initializeSmsPayment = async (req, res) => {
     const paystackResult = await paystackResponse.json();
 
     if (!paystackResponse.ok || !paystackResult.status) {
-      console.error(
-        'Paystack initialization rejected:',
-        paystackResult
-      );
+      console.error('Paystack initialization rejected:', paystackResult);
 
       await supabase
         .from('sms_payment_orders')
@@ -250,7 +314,6 @@ export const verifySmsPayment = async (req, res) => {
       });
     }
 
-    // Find the order belonging to this authenticated garage.
     const { data: order, error: orderError } = await supabase
       .from('sms_payment_orders')
       .select(
@@ -276,7 +339,6 @@ export const verifySmsPayment = async (req, res) => {
       });
     }
 
-    // An already-paid order must never be credited again.
     if (order.status === 'paid') {
       return res.json({
         success: true,
@@ -295,32 +357,21 @@ export const verifySmsPayment = async (req, res) => {
       });
     }
 
-    // Verify the transaction directly with Paystack.
-    const verifyResponse = await fetch(
-      `${PAYSTACK_BASE_URL}/transaction/verify/${encodeURIComponent(reference)}`,
-      {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${secretKey}`,
-          'Content-Type': 'application/json'
-        }
-      }
+    const transaction = await verifyPaystackTransaction(
+      reference,
+      secretKey
     );
 
-    const verifyResult = await verifyResponse.json();
+    if (transaction.status === 'failed') {
+      await markPaymentFailed(order, transaction);
 
-    if (!verifyResponse.ok || !verifyResult.status) {
-      console.error('Paystack verification request failed:', verifyResult);
-
-      return res.status(502).json({
+      return res.status(409).json({
         success: false,
-        message: 'Unable to verify payment with Paystack.'
+        message: 'Paystack confirmed that this payment failed.',
+        paymentStatus: 'failed'
       });
     }
 
-    const transaction = verifyResult.data;
-
-    // Do not credit pending, failed, or otherwise unsuccessful payments.
     if (transaction.status !== 'success') {
       return res.status(409).json({
         success: false,
@@ -329,16 +380,15 @@ export const verifySmsPayment = async (req, res) => {
       });
     }
 
-    // Match every critical value against our stored order.
-    if (
-      transaction.reference !== order.reference ||
-      Number(transaction.amount) !== order.amount_kobo ||
-      transaction.currency !== order.currency ||
-      !Number.isSafeInteger(Number(transaction.id)) ||
-      Number(transaction.id) <= 0
-    ) {
-      console.error('Paystack transaction does not match order:', {
+    const completion = await completeSuccessfulPayment(
+      order,
+      transaction
+    );
+
+    if (!completion.valid) {
+      console.error('Paystack transaction/order mismatch:', {
         reference,
+        transactionStatus: transaction.status,
         verifiedReference: transaction.reference,
         verifiedAmount: transaction.amount,
         expectedAmount: order.amount_kobo,
@@ -352,48 +402,13 @@ export const verifySmsPayment = async (req, res) => {
       });
     }
 
-    // Atomically credit the wallet and mark the order as paid.
-    const { data: completionResult, error: completionError } =
-      await supabase.rpc('complete_sms_payment_order', {
-        p_reference: order.reference,
-        p_paystack_transaction_id: Number(transaction.id),
-        p_verified_amount_kobo: Number(transaction.amount),
-        p_verified_currency: transaction.currency
-      });
-
-    if (completionError) {
-      console.error(
-        'Atomic payment completion failed:',
-        completionError
-      );
-
-      return res.status(500).json({
-        success: false,
-        message: 'Payment was verified, but wallet processing needs attention.',
-        reference: order.reference
-      });
-    }
-
-    if (!completionResult?.success) {
-      console.error(
-        'Unexpected payment completion response:',
-        completionResult
-      );
-
-      return res.status(500).json({
-        success: false,
-        message: 'Wallet processing could not be confirmed.',
-        reference: order.reference
-      });
-    }
-
     return res.json({
       success: true,
-      alreadyPaid: Boolean(completionResult.duplicate),
+      alreadyPaid: Boolean(completion.result.duplicate),
       reference: order.reference,
       credits: order.credits,
-      walletResult: completionResult.wallet_result || null,
-      message: completionResult.duplicate
+      walletResult: completion.result.wallet_result || null,
+      message: completion.result.duplicate
         ? 'Payment was already processed.'
         : 'Payment verified and SMS credits added successfully.'
     });
@@ -408,9 +423,7 @@ export const verifySmsPayment = async (req, res) => {
   }
 };
 
-
 // POST /api/webhooks/paystack
-// Paystack payment-success webhook.
 export const handlePaystackWebhook = async (req, res) => {
   try {
     const secretKey = getPaystackSecret();
@@ -420,7 +433,6 @@ export const handlePaystackWebhook = async (req, res) => {
       return res.status(503).json({ success: false });
     }
 
-    // Paystack signature verification requires the original raw body.
     if (!Buffer.isBuffer(req.body)) {
       console.error('[Paystack Webhook] Raw request body is missing.');
       return res.status(400).json({ success: false });
@@ -454,8 +466,11 @@ export const handlePaystackWebhook = async (req, res) => {
       return res.status(400).json({ success: false });
     }
 
-    // We only process successful charges.
-    if (event.event !== 'charge.success') {
+    // We only handle successful and failed charge events.
+    if (
+      event.event !== 'charge.success' &&
+      event.event !== 'charge.failed'
+    ) {
       return res.status(200).json({
         success: true,
         message: 'Event ignored.'
@@ -473,7 +488,6 @@ export const handlePaystackWebhook = async (req, res) => {
       return res.status(400).json({ success: false });
     }
 
-    // Look up the order created by AutoTrack.
     const { data: order, error: orderError } = await supabase
       .from('sms_payment_orders')
       .select(
@@ -488,16 +502,12 @@ export const handlePaystackWebhook = async (req, res) => {
     }
 
     if (!order) {
-      console.error('[Paystack Webhook] No matching order:', reference);
-
-      // This reference does not belong to a known AutoTrack order.
       return res.status(200).json({
         success: true,
         message: 'No matching AutoTrack order.'
       });
     }
 
-    // Already completed: acknowledge without crediting again.
     if (order.status === 'paid') {
       return res.status(200).json({
         success: true,
@@ -506,55 +516,49 @@ export const handlePaystackWebhook = async (req, res) => {
     }
 
     if (order.status !== 'pending') {
-      console.warn('[Paystack Webhook] Order is not pending:', {
-        reference,
-        status: order.status
-      });
-
       return res.status(200).json({
         success: true,
         message: 'Order is not pending.'
       });
     }
 
-    // Independently verify the transaction with Paystack.
-    const verifyResponse = await fetch(
-      `${PAYSTACK_BASE_URL}/transaction/verify/${encodeURIComponent(reference)}`,
-      {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${secretKey}`,
-          'Content-Type': 'application/json'
-        }
-      }
+    const transaction = await verifyPaystackTransaction(
+      reference,
+      secretKey
     );
 
-    if (!verifyResponse.ok) {
-      console.error(
-        '[Paystack Webhook] Paystack verification HTTP error:',
-        verifyResponse.status
-      );
-      return res.status(502).json({ success: false });
+    // A failed event is only trusted after direct verification.
+    if (event.event === 'charge.failed') {
+      if (
+        transaction.status === 'failed' &&
+        transaction.reference === order.reference
+      ) {
+        await markPaymentFailed(order, transaction);
+
+        console.log('[Paystack Webhook] Failed payment recorded:', {
+          reference
+        });
+
+        return res.status(200).json({
+          success: true,
+          paymentStatus: 'failed'
+        });
+      }
+
+      // Do not change the order if Paystack still reports processing,
+      // success, or any other unexpected state.
+      return res.status(200).json({
+        success: true,
+        message: 'Failure event not confirmed by Paystack.'
+      });
     }
 
-    const verifyResult = await verifyResponse.json();
+    const completion = await completeSuccessfulPayment(
+      order,
+      transaction
+    );
 
-    if (!verifyResult.status || !verifyResult.data) {
-      console.error('[Paystack Webhook] Invalid verification response.');
-      return res.status(502).json({ success: false });
-    }
-
-    const transaction = verifyResult.data;
-
-    // Confirm every critical payment value against our stored order.
-    if (
-      transaction.status !== 'success' ||
-      transaction.reference !== order.reference ||
-      Number(transaction.amount) !== order.amount_kobo ||
-      transaction.currency !== order.currency ||
-      !Number.isSafeInteger(Number(transaction.id)) ||
-      Number(transaction.id) <= 0
-    ) {
+    if (!completion.valid) {
       console.error('[Paystack Webhook] Transaction/order mismatch:', {
         reference,
         transactionStatus: transaction.status,
@@ -565,47 +569,18 @@ export const handlePaystackWebhook = async (req, res) => {
         expectedCurrency: order.currency
       });
 
-      // Do not credit an unverified or mismatched transaction.
       return res.status(400).json({ success: false });
-    }
-
-    // Atomically credit the wallet and mark the order as paid.
-    const { data: completionResult, error: completionError } =
-      await supabase.rpc('complete_sms_payment_order', {
-        p_reference: order.reference,
-        p_paystack_transaction_id: Number(transaction.id),
-        p_verified_amount_kobo: Number(transaction.amount),
-        p_verified_currency: transaction.currency
-      });
-
-    if (completionError) {
-      console.error(
-        '[Paystack Webhook] Atomic payment completion failed:',
-        completionError
-      );
-
-      // Non-2xx response allows Paystack to retry.
-      return res.status(500).json({ success: false });
-    }
-
-    if (!completionResult?.success) {
-      console.error(
-        '[Paystack Webhook] Unexpected completion result:',
-        completionResult
-      );
-
-      return res.status(500).json({ success: false });
     }
 
     console.log('[Paystack Webhook] Payment processed:', {
       reference,
       credits: order.credits,
-      duplicate: Boolean(completionResult.duplicate)
+      duplicate: Boolean(completion.result.duplicate)
     });
 
     return res.status(200).json({
       success: true,
-      alreadyPaid: Boolean(completionResult.duplicate)
+      alreadyPaid: Boolean(completion.result.duplicate)
     });
 
   } catch (error) {
