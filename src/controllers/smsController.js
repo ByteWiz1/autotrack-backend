@@ -1,7 +1,109 @@
 
 import { supabase } from '../config/supabase.js';
 
+
+const getCombinedSmsTransactions = async (shopId, limit = 100) => {
+  const [
+    { data: walletTransactions, error: walletError },
+    { data: paymentOrders, error: ordersError }
+  ] = await Promise.all([
+    supabase
+      .from('sms_transactions')
+      .select('*')
+      .eq('shop_id', shopId)
+      .order('created_at', { ascending: false })
+      .limit(limit),
+
+    supabase
+      .from('sms_payment_orders')
+      .select(`
+        id,
+        shop_id,
+        reference,
+        credits,
+        amount_kobo,
+        currency,
+        status,
+        failure_reason,
+        paystack_transaction_id,
+        created_at,
+        updated_at
+      `)
+      .eq('shop_id', shopId)
+      .order('created_at', { ascending: false })
+      .limit(limit)
+  ]);
+
+  if (walletError) throw walletError;
+  if (ordersError) throw ordersError;
+
+  const walletRows = walletTransactions || [];
+
+  // Prevent completed payments from appearing twice.
+  const completedReferences = new Set(
+    walletRows
+      .map(transaction => transaction.payment_reference)
+      .filter(Boolean)
+  );
+
+  const paymentRows = (paymentOrders || [])
+    .filter(order => {
+      const status = String(order.status || '')
+        .toLowerCase()
+        .trim();
+
+      return !(
+        status === 'paid' &&
+        completedReferences.has(order.reference)
+      );
+    })
+    .map(order => {
+      const status = String(order.status || '')
+        .toLowerCase()
+        .trim();
+
+      const credits = Number(order.credits) || 0;
+      const isPaid = status === 'paid';
+
+      return {
+        id: `payment-order-${order.id}`,
+        shop_id: order.shop_id,
+
+        transaction_type: 'payment_attempt',
+        type: 'payment_attempt',
+        description: 'SMS credit purchase',
+
+        status: order.status,
+        failure_reason: order.failure_reason,
+
+        // Only show added credits for a paid order.
+        credit_change: isPaid ? credits : 0,
+        requested_credits: credits,
+
+        amount_paid: Number(order.amount_kobo) / 100,
+        currency: order.currency,
+
+        reference: order.reference,
+        payment_reference: order.reference,
+        gateway_reference: order.paystack_transaction_id,
+
+        created_at: order.created_at,
+        updated_at: order.updated_at,
+
+        source: 'sms_payment_orders'
+      };
+    });
+
+  return [...walletRows, ...paymentRows]
+    .sort((a, b) =>
+      new Date(b.created_at).getTime() -
+      new Date(a.created_at).getTime()
+    )
+    .slice(0, limit);
+};
+
 // GET SMS WALLET BALANCE
+
 export const getSmsWallet = async (req, res) => {
   try {
     const { data: shop, error } = await supabase
@@ -12,28 +114,25 @@ export const getSmsWallet = async (req, res) => {
 
     if (error) throw error;
 
-    const { data: transactions, error: transactionError } = await supabase
-      .from('sms_transactions')
-      .select('*')
-      .eq('shop_id', req.shop.id)
-      .order('created_at', { ascending: false })
-      .limit(20);
+    const transactions = await getCombinedSmsTransactions(
+      req.shop.id,
+      20
+    );
 
-    if (transactionError) throw transactionError;
-
-    const { data: notifications, error: notificationError } = await supabase
-      .from('sms_notifications')
-      .select('*')
-      .eq('shop_id', req.shop.id)
-      .eq('status', 'unread')
-      .order('created_at', { ascending: false });
+    const { data: notifications, error: notificationError } =
+      await supabase
+        .from('sms_notifications')
+        .select('*')
+        .eq('shop_id', req.shop.id)
+        .eq('status', 'unread')
+        .order('created_at', { ascending: false });
 
     if (notificationError) throw notificationError;
 
     return res.status(200).json({
       success: true,
       balance: shop.sms_credits,
-      transactions: transactions || [],
+      transactions,
       notifications: notifications || []
     });
   } catch (error) {
@@ -117,23 +216,23 @@ export const markSmsNotificationRead = async (req, res) => {
 };
 
 // GET SMS TRANSACTION HISTORY
+
 export const getSmsTransactions = async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('sms_transactions')
-      .select('*')
-      .eq('shop_id', req.shop.id)
-      .order('created_at', { ascending: false })
-      .limit(100);
-
-    if (error) throw error;
+    const transactions = await getCombinedSmsTransactions(
+      req.shop.id,
+      100
+    );
 
     return res.status(200).json({
       success: true,
-      transactions: data || []
+      transactions
     });
   } catch (error) {
-    console.error('SMS transaction history error:', error.message);
+    console.error(
+      'SMS transaction history error:',
+      error.message
+    );
 
     return res.status(500).json({
       success: false,
